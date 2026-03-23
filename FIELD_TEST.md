@@ -1,33 +1,24 @@
-# Quasar Field Test
+# Taking Quasar for a Spin
 
-**Date:** March 23, 2026
-**Framework:** Quasar v0.0.0 (pre-release, unaudited)
-**Repository:** https://github.com/blueshift-gg/quasar
-**Environment:** WSL Ubuntu, Rust 1.94.0, cargo-build-sbf 3.0.13
+**March 23, 2026**
 
----
+Quasar is a Solana program framework. It claims to be faster than hand-written code, zero-copy, zero-allocation, and ergonomic enough to replace Anchor. Those are big claims for a v0.0.0 project by a two-person team. We decided to find out if any of it holds up.
 
-## What This Is
+## Cloning the Repo
 
-A hands-on, end-to-end field test of the Quasar Solana framework. We cloned the repo, read every file, built every example, ran every test, benchmarked the compute unit costs, scaffolded a new project from scratch, wrote a custom program, and documented everything we found along the way.
+We started by reading everything. The [repository](https://github.com/blueshift-gg/quasar) is a Cargo workspace with 13 directories and roughly 23 crates. We enumerated every file (293 total), read 189 of them line by line, and confirmed the remaining 102 via pattern sampling. Two were binaries. The codebase covers the core runtime (`lang`), procedural macros (`derive`), alignment-1 integer types (`pod`), SPL Token integration (`spl`), four-target IDL code generation (`idl`), a compute unit profiler (`profile`), the CLI (`cli`), six example programs, six test programs, and a comprehensive integration suite.
 
-The goal was to answer one question: is Quasar real, or is it vapor?
+The [documentation](https://quasar-lang.com) spans 31 pages across nine sections. It covers enough to get started but stops short of explaining the internal mechanics. How the Pod types actually work, how the PDA optimization achieves its savings, how `set_inner()` handles conversion, how bumps flow through the generated code. Those answers live in the source, not the docs.
 
----
+## Building Everything
 
-## What We Tested
+We ran `make build-sbf` and compiled nine SBF binaries: three example programs (vault, escrow, multisig) and six test programs (accounts, errors, events, misc, PDA, sysvar/token CPI). We also built a raw Pinocchio vault from the repo's examples for later comparison. All ten binaries compiled cleanly.
 
-### Building the Existing Codebase
+## Running Every Test
 
-The Quasar repository is a Cargo workspace with 13 top-level directories and roughly 23 crates. We built all SBF binaries using `cargo build-sbf` via the provided Makefile. Nine programs compiled successfully: three example programs (vault, escrow, multisig), six test programs (accounts, errors, events, misc, PDA, sysvar, token CPI). We also compiled a raw Pinocchio vault from the repo's examples for comparison.
-
-### Running the Test Suite
-
-The repository ships 692 tests. We ran every single one.
+The repo ships 692 tests. We ran all of them.
 
 **692 passed. 0 failed.**
-
-The breakdown:
 
 | Suite | Tests | Coverage |
 |---|---|---|
@@ -41,151 +32,121 @@ The breakdown:
 | Vault | 3 | Deposit, withdraw, program ID |
 | Compile-fail | 11 | Dynamic_vec alignment, fixed after dynamic, multiple tails, zero discriminator |
 
-### Benchmarking Compute Units
+The 146 Miri tests are worth calling out. They run under Tree Borrows with symbolic alignment checking, validating memory safety for the zero-copy pointer casting that sits at the heart of the framework. All passed.
 
-The CU numbers come from the test output logs -- actual SVM execution via mollusk-svm, not estimates.
+## Measuring the Compute Units
 
-**Quasar Vault:**
-- Deposit (system transfer CPI to PDA vault): **1,576 CU**
-- Withdraw (set_lamports from PDA vault): **410 CU**
+These numbers come from the test output logs. Actual SVM execution via mollusk-svm, not projections.
 
-**Quasar Escrow:**
-- Make (init escrow PDA + init_if_needed ATAs + token transfer + event): **29,292 CU**
-- Take (validate escrow + two token transfers + close vault ATA + event): **21,573 CU**
-- Refund (token transfer back + close escrow + event): **8,516 CU**
+**Quasar Vault:** Deposit 1,576 CU. Withdraw 410 CU.
+**Quasar Escrow:** Make 29,292 CU. Take 21,573 CU. Refund 8,516 CU.
+**Quasar Multisig:** Create 2,013 CU. Execute transfer 3,774 CU.
 
-**Quasar Multisig:**
-- Create (init PDA, write signer array, set label): **2,013 CU**
-- Execute transfer (iterate signers, count threshold, signed CPI transfer): **3,774 CU**
+A vault withdraw at 410 CU is remarkably low. For context, that covers reading a PDA, validating ownership, and transferring lamports back to the caller.
 
-### CU Comparison: Quasar vs Raw Pinocchio
+## Comparing Against Pinocchio
 
-The repository ships a raw Pinocchio implementation of the same vault doing the same thing -- accept SOL deposits to a PDA, allow SOL withdrawals. We built and tested both under the same conditions.
+The repository includes a Pinocchio implementation of the same vault. Same logic, same test setup, same SVM configuration. The only difference is the framework.
 
-| Operation | Quasar Vault | Pinocchio Vault | Quasar Savings |
+| Operation | Quasar | Pinocchio | Savings |
 |---|---|---|---|
-| **Deposit** | **1,576 CU** | **2,833 CU** | **44% cheaper** |
-| **Withdraw** | **410 CU** | **1,635 CU** | **75% cheaper** |
+| Deposit | 1,576 CU | 2,833 CU | 44% |
+| Withdraw | 410 CU | 1,635 CU | 75% |
 
-Quasar -- a framework -- beats hand-written Pinocchio -- the lowest-level Solana framework available.
+Pinocchio is the lowest-level Solana framework available. It is one step above writing raw bytes. Quasar, a macro-driven framework with account validation and auto-generated clients, produces cheaper programs.
 
-The reason is PDA derivation cost. Pinocchio calls `find_program_address`, which brute-forces bump seeds from 255 downward via the `sol_create_program_address` syscall at roughly 1,500 CU per call. Quasar's `#[account(seeds = [...], bump)]` attribute generates optimized code that computes the hash via `sol_sha256` and validates via `sol_curve_validate_point`, reducing the cost to roughly 300 CU.
+The reason comes down to PDA derivation. Pinocchio calls `find_program_address`, which brute-forces bump seeds from 255 downward using the `sol_create_program_address` syscall. That costs roughly 1,500 CU per invocation. Quasar's `#[account(seeds = [...], bump)]` generates code that computes the hash directly via `sol_sha256` and checks the curve point via `sol_curve_validate_point`. About 300 CU.
 
-The Quasar vault deposit instruction is 19 lines. The Pinocchio vault deposit instruction is 77 lines. The framework code is 4x shorter and 44% cheaper.
+The Quasar vault deposit is also 19 lines of Rust. The Pinocchio vault deposit is 77.
 
-### Scaffolding a New Project
+## Scaffolding a New Project
 
-We ran `quasar init my-program` in a fresh directory. It generated a minimal but complete project: `Cargo.toml` (cdylib crate with quasar-lang), `Quasar.toml` (project config), `src/lib.rs` (32-line no-op program), `src/tests.rs` (39-line test using quasar-svm), and a pre-generated keypair.
+We wanted to know if the framework works when you are starting from scratch, so we ran `quasar init my-program` in a clean directory. It produced a `Cargo.toml`, a `Quasar.toml`, a 32-line program with a single no-op instruction, a 39-line test file, and a pre-generated keypair.
 
-First build: `quasar build` produced a 2.9 KB binary in 36.7 seconds. It also auto-generated a typed Rust client crate with instruction structs that stay in sync with the program -- regenerated from the macros on every build.
+`quasar build` compiled the binary (2.9 KB) in 36.7 seconds. It also auto-generated a typed Rust client crate at `target/client/rust/my-program-client/`, with instruction structs derived from the program's macros. Every time the program changes and rebuilds, the client regenerates to stay in sync.
 
-First test: `quasar test` passed (1/1) in 2m 17s (dominated by first-time compilation of quasar-svm dependencies).
+`quasar test` compiled test dependencies (2 minutes 17 seconds for the first run, mostly quasar-svm) and ran the single test. It passed. The full pipeline works: init, build, test.
 
-The pipeline works: `quasar init` to `quasar build` to `quasar test`, from zero to green.
+## Writing a Counter Program
 
-### Writing a Custom Program
+We replaced the scaffolded code with something that exercises real features. A counter program with two instructions: `initialize` creates a PDA account seeded on the payer, `increment` adds one to the stored count. The account stores authority, count, and bump.
 
-We replaced the scaffold with a counter program. Two instructions: `initialize` creates a PDA counter account seeded on the payer, `increment` bumps the count by one. The counter stores authority, count, and bump.
+It did not compile on the first try.
 
-This is where we learned things the docs don't tell you.
+The `#[account]` macro converts `u64` to `PodU64`, a `[u8; 8]` wrapper that guarantees alignment 1 for zero-copy safety. You cannot assign `0` to a `PodU64` field directly. The correct approach is `set_inner()`, which takes native types in field order and handles Pod conversion. We found this by reading the escrow example's `make.rs`, because the docs do not explain it.
 
-The `#[account]` macro converts all fields to Pod equivalents. `u64` becomes `PodU64`, a `[u8; 8]` wrapper. You cannot assign `0` to a `PodU64`. The correct way to initialize an account is `set_inner()`, which takes native types in field order and handles Pod conversion. We found this pattern in the escrow example's `make.rs`.
+Bump seeds are accessed through `ctx.bumps`, a struct generated by `#[derive(Accounts)]`. They are computed by the framework during account validation. We found this pattern in the escrow's dispatcher, again because the docs do not cover it.
 
-Bump seeds are accessed via `ctx.bumps`, a generated struct. Not passed as instruction arguments, not computed manually. Found this in the escrow's `lib.rs`.
+PodU64 arithmetic requires typed literals. `self.counter.count += 1u64` compiles. `+= 1` does not, because `1` defaults to `i32`. `+= 1.into()` does not, because `From` is implemented for too many types and the compiler cannot resolve the ambiguity. We found this by reading the Pod crate source after hitting compiler errors.
 
-PodU64 arithmetic requires typed literals: `+= 1u64` works, `+= 1` does not (1 is i32), `+= 1.into()` does not (ambiguous From impls). Found this by reading the Pod crate source after compiler errors.
+Also, `cargo build` does not work for these programs. They are `#![no_std]` cdylib crates targeting the SBF instruction set. The correct command is `quasar build`, which wraps `cargo build-sbf`.
 
-`cargo build` does not work. These are `#![no_std]` cdylib crates targeting SBF. Use `quasar build`.
+Once we understood these patterns, the counter compiled in 4.5 seconds and produced a 7.2 KB binary. The auto-generated client included both `InitializeInstruction` and `IncrementInstruction`.
 
-With these lessons applied: `quasar build` compiled the counter in 4.5 seconds, producing a 7.2 KB binary. The auto-generated client produced both `InitializeInstruction` and `IncrementInstruction`.
+## Testing the Counter
 
-### Testing the Custom Program
+The single-instruction test passed immediately. Initialize creates the PDA, sets the authority, stores the bump, writes count as zero.
 
-Single-instruction test (`test_initialize`) passed immediately.
+The multi-instruction test failed. Initialize then increment, two separate `process_instruction` calls. The increment instruction rejected the counter account with `IllegalOwner` at 42 compute units.
 
-Multi-instruction test (initialize then increment) failed with `IllegalOwner` at 42 CU. The program was rejecting the counter account because its owner was not the program ID. We had just created it.
+42 CU is barely enough to read the discriminator and start account validation. The program was checking the counter's owner field, finding system program instead of our program ID, and returning an error. But we had just created the counter in the previous call. It should have been owned by our program.
 
-We diagnosed this by reading the quasar-svm source. Added debug prints between calls:
+We added debug prints between the two calls:
 
 ```
 Counter account after init: exists = false
 Payer account after init: exists = true, lamports = 9998816800
 ```
 
-The counter was never committed to the SVM store after init. The payer was. Root cause: `deconstruct_resulting_accounts` in quasar-svm's `svm.rs` iterates only the pre-execution account list when reconstructing post-execution state. Accounts created during execution (via init / system program CPI) exist in the transaction context but are not in the pre-execution list, so they are silently dropped during commit.
+The payer was committed to the SVM store correctly. Lamports reduced from 10 billion, with the difference covering rent for the new account. But the counter itself was gone. The init instruction succeeded, account creation happened (we can see the lamport deduction), yet the created account was never persisted.
 
-This is a bug. Sequential `process_instruction` calls cannot create-then-use accounts across calls.
+We traced this through quasar-svm's source. The `deconstruct_resulting_accounts` function reconstructs post-execution account state by iterating the pre-execution account list and looking each one up in the transaction context. Accounts that did not exist before execution are not in that list. Accounts created during execution via CPI (like the system program creating our counter) exist in the transaction context but are never iterated, never reconstructed, never committed back to the store.
 
-Workaround: `process_instruction_chain` runs multiple instructions in a single atomic transaction, where instruction 2 sees accounts created by instruction 1 within the shared transaction context.
+The payer was committed because we provided it before execution. The counter was silently dropped because it was born during execution.
 
-With the workaround applied: all 3 tests pass.
+This is a bug in quasar-svm.
 
----
+The workaround is `process_instruction_chain`, which runs multiple instructions in a single atomic transaction. Both instructions share the same transaction context, so instruction two sees accounts created by instruction one. No commit step in between, no dropped accounts.
 
-## The Verdict
+We rewrote the test, ran it, and all three tests passed.
 
-### What Is Real
+## What We Walked Away With
 
-**The performance.** Quasar is faster than hand-written Pinocchio. Not by a small margin -- 44% cheaper on deposits, 75% cheaper on withdrawals. The optimized PDA derivation alone saves over 1,000 CU per call. A framework has no business being faster than the lowest-level alternative, but Quasar is.
+The performance is real. Quasar produces programs that cost fewer compute units than hand-written Pinocchio. The optimized PDA derivation saves over 1,000 CU per invocation, and the framework's validation overhead is lower than manual validation in raw Pinocchio. We measured this directly.
 
-**The zero-copy architecture.** 146 Miri tests validate memory safety under Tree Borrows. The Pod type system enforces alignment-1 at compile time. `no_alloc!` makes heap allocation physically impossible at runtime. This is not a claim -- it is structurally embedded in the code and verified by tooling.
+The zero-copy architecture is real. 146 Miri tests validate memory safety. The Pod type system enforces alignment at compile time. `no_alloc!` makes heap allocation impossible at runtime. These are structural properties of the code, verified by tooling.
 
-**The test suite.** 692 tests, zero failures. Integration, memory safety, arithmetic, compile-time errors, and full program lifecycles. The coverage is comprehensive.
+The test coverage is thorough. 692 tests across nine suites, covering integration, memory safety, arithmetic, token operations, and compile-time error checking. All green.
 
-**The developer experience.** `quasar init` to `quasar build` to `quasar test` works end-to-end. The Anchor-mirror API means the learning curve is minimal. Auto-generated typed client crates are a meaningful quality-of-life feature.
+The developer experience works. The pipeline from `quasar init` to `quasar build` to `quasar test` runs end to end. The Anchor-like API keeps the learning curve shallow. Auto-generated typed clients are a genuine quality-of-life feature.
 
-### What Is Not Ready
+But the edges are rough.
 
-**The test harness has a bug.** quasar-svm silently drops accounts created via CPI during `process_instruction` calls. Any program that creates accounts and then uses them in a subsequent test step will fail unless you use `process_instruction_chain`. This is a solvable bug, but it is present today and would confuse any developer who hits it.
+The test harness silently drops CPI-created accounts between calls. A developer hitting this would waste hours before discovering `process_instruction_chain` as the workaround, because the error message gives no indication of the actual problem.
 
-**Windows is not supported.** The `quasar-profile` crate depends on Unix system calls. The CLI cannot be installed natively on Windows. We had to use WSL for the entire field test.
+Windows is not supported. The `quasar-profile` crate depends on Unix system calls. We ran the entire field test through WSL.
 
-**Documentation has gaps.** 31 pages cover the what and how, but not the why. The Pod type rules (`+= 1u64`, not `+= 1`), the `set_inner()` initialization pattern, the `ctx.bumps` access pattern -- all of these required reading example source code to figure out. A developer without access to examples would hit compile errors with no guidance.
+The documentation explains what things are but not how to use them in practice. Pod type arithmetic rules, the `set_inner()` initialization pattern, the `ctx.bumps` access pattern, the difference between quasar-svm and mollusk-svm. All of these required reading example source code or the framework internals. A developer without that instinct would hit walls.
 
-**It is version 0.0.0.** Pre-release, unaudited, built by a two-person team. The engineering quality is high, but the ecosystem maturity is not there yet.
-
-### The Hoops
-
-Things we had to figure out that the documentation did not explain:
-
-1. **Pod type arithmetic** -- `+= 1u64` is correct, `+= 1` is not, `+= 1.into()` is ambiguous. Only discoverable by reading the Pod crate source or getting compiler errors.
-
-2. **Account initialization** -- `set_inner()` takes native types in field order. The macro handles Pod conversion. Found this by reading the escrow example, not the docs.
-
-3. **Bump access** -- `ctx.bumps` is a generated struct with a field per bump-annotated account. Not passed as instruction arguments. Found this by reading the escrow dispatch pattern.
-
-4. **Build command** -- `cargo build` fails. `quasar build` (wrapping `cargo build-sbf`) is required. The programs are `#![no_std]` cdylib crates targeting SBF.
-
-5. **Test harness difference** -- Scaffolded projects use quasar-svm. The repo's internal tests use mollusk-svm. Different APIs, different behavior, not documented.
-
-6. **CPI-created account commit bug** -- Accounts created via init/CPI during `process_instruction` vanish between calls. Workaround: `process_instruction_chain`.
-
-7. **Windows incompatibility** -- `quasar-profile` crate uses Unix system calls. Must use WSL or a Linux/macOS machine.
+It is version 0.0.0. Unaudited. Built by two people. The engineering quality is high. The ecosystem around it has not caught up yet.
 
 ---
 
-## Reproduction
-
-To run this yourself:
+## Reproducing This
 
 ```bash
-# Prerequisites: Rust, cargo-build-sbf, quasar-cli
 cargo install quasar-cli
-
-# Clone and build
 git clone https://github.com/AngryPacifist/quasar-field-test.git
 cd quasar-field-test
 quasar build
 quasar test
 ```
 
-Expected output: 3 tests passed (test_id, test_initialize, test_initialize_and_increment).
-
----
+Three tests pass: test_id, test_initialize, test_initialize_and_increment.
 
 ## Files
 
-- `src/lib.rs` -- Counter program: init (PDA, set_inner, bump) + increment (PodU64, has_one)
-- `src/tests.rs` -- Tests: single-instruction init + chained init-then-increment
-- `Cargo.toml` -- Dependencies: quasar-lang, quasar-svm, auto-generated client
-- `Quasar.toml` -- Project config: solana toolchain, quasarsvm-rust testing
+- `src/lib.rs` : Counter program with init and increment instructions
+- `src/tests.rs` : Single-instruction and chained multi-instruction tests
+- `Cargo.toml` : Dependencies (quasar-lang, quasar-svm, auto-generated client)
+- `Quasar.toml` : Solana toolchain and quasarsvm-rust testing config
